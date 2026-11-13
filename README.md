@@ -1,4 +1,4 @@
-# opencode-googlesearch
+# @san-kit/opencode-googlesearch
 
 A Google Search tool for OpenCode V2 backed by the
 [DataForSEO](https://dataforseo.com/) SERP API. It returns live Google results,
@@ -20,7 +20,7 @@ to disk.
 ## Install
 
 ```sh
-opencode plugin add opencode-googlesearch
+opencode plugin add @san-kit/opencode-googlesearch
 ```
 
 Or add it to `opencode.jsonc`:
@@ -28,7 +28,7 @@ Or add it to `opencode.jsonc`:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-googlesearch"],
+  "plugins": ["@san-kit/opencode-googlesearch"],
 }
 ```
 
@@ -37,8 +37,8 @@ Or add it to `opencode.jsonc`:
 `opencode plugin add ...` installs the plugin **globally**, so it is available
 in every project. To scope it to one project, add the package to that project's
 `opencode.json(c)` under `plugins` instead. A project can also disable a
-globally installed plugin with `"-opencode-googlesearch"` in its `plugins`
-array.
+globally installed plugin with `"-opencode-googlesearch"` (the plugin ID) in its
+`plugins` array.
 
 ### Where files live
 
@@ -169,7 +169,7 @@ or with a plugin option:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-googlesearch",
+      "package": "@san-kit/opencode-googlesearch",
       "options": { "history": false },
     },
   ],
@@ -194,7 +194,7 @@ Example:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-googlesearch",
+      "package": "@san-kit/opencode-googlesearch",
       "options": {
         "history": true,
         "historyPath": "/Users/me/opencode-logs/googlesearch",

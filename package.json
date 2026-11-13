@@ -1,5 +1,5 @@
 {
-  "name": "opencode-googlesearch",
+  "name": "@san-kit/opencode-googlesearch",
   "version": "1.0.0",
   "description": "Google Search for OpenCode V2 using DataForSEO, with built-in credential onboarding.",
   "type": "module",
