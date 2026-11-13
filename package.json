@@ -1,0 +1,43 @@
+{
+  "name": "opencode-googlesearch",
+  "version": "1.0.0",
+  "description": "Google Search for OpenCode V2 using DataForSEO, with built-in credential onboarding.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/san-kit/opencode-googlesearch.git"
+  },
+  "homepage": "https://github.com/san-kit/opencode-googlesearch#readme",
+  "bugs": {
+    "url": "https://github.com/san-kit/opencode-googlesearch/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "google",
+    "search",
+    "serp",
+    "dataforseo"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "data",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "^2.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  }
+}
