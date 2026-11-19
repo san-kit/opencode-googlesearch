@@ -1,7 +1,35 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Plugin } from "@opencode/plugin";
-import { resolveDataForSeoCredentials } from "../src/credentials.ts";
+import {
+  registerDataForSeoIntegration,
+  resolveDataForSeoCredentials,
+} from "../src/credentials.ts";
+
+function setEnv(
+  t: { after: (fn: () => void) => void },
+  values: Record<string, string | undefined>,
+): void {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  t.after(() => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
+
+function clearCredentialEnv(t: { after: (fn: () => void) => void }): void {
+  setEnv(t, {
+    DATAFORSEO_LOGIN: undefined,
+    DATAFORSEO_PASSWORD: undefined,
+  });
+}
 
 function ctxWith(input: {
   connection?: unknown;
@@ -18,15 +46,7 @@ function ctxWith(input: {
 }
 
 test("DataForSEO: environment variables win", async (t) => {
-  const previousLogin = process.env.DATAFORSEO_LOGIN;
-  const previousPassword = process.env.DATAFORSEO_PASSWORD;
-  t.after(() => {
-    if (previousLogin === undefined) delete process.env.DATAFORSEO_LOGIN;
-    else process.env.DATAFORSEO_LOGIN = previousLogin;
-    if (previousPassword === undefined) delete process.env.DATAFORSEO_PASSWORD;
-    else process.env.DATAFORSEO_PASSWORD = previousPassword;
-  });
-
+  clearCredentialEnv(t);
   process.env.DATAFORSEO_LOGIN = "env-login";
   process.env.DATAFORSEO_PASSWORD = "env-password";
 
@@ -36,7 +56,27 @@ test("DataForSEO: environment variables win", async (t) => {
   });
 });
 
-test("DataForSEO: external credential metadata", async () => {
+test("DataForSEO: key credential with login metadata", async (t) => {
+  clearCredentialEnv(t);
+
+  const ctx = ctxWith({
+    connection: { type: "credential", id: "cred_1", label: "DataForSEO" },
+    credential: {
+      type: "key",
+      key: "key-password",
+      metadata: { login: "form-login" },
+    },
+  });
+
+  assert.deepEqual(await resolveDataForSeoCredentials(ctx), {
+    login: "form-login",
+    password: "key-password",
+  });
+});
+
+test("DataForSEO: legacy external credential metadata", async (t) => {
+  clearCredentialEnv(t);
+
   const ctx = ctxWith({
     connection: { type: "credential", id: "cred_1", label: "DataForSEO" },
     credential: {
@@ -52,7 +92,9 @@ test("DataForSEO: external credential metadata", async () => {
   });
 });
 
-test("DataForSEO: login:password key", async () => {
+test("DataForSEO: login:password key", async (t) => {
+  clearCredentialEnv(t);
+
   const ctx = ctxWith({
     connection: { type: "credential", id: "cred_1", label: "DataForSEO" },
     credential: { type: "key", key: "key-login:key-password" },
@@ -64,7 +106,33 @@ test("DataForSEO: login:password key", async () => {
   });
 });
 
-test("DataForSEO: not connected", async () => {
+test("DataForSEO: registers a key method with a login field", async () => {
+  let method: any;
+  const ctx = {
+    integration: {
+      transform: async (fn: any) =>
+        fn({
+          update: () => {},
+          method: {
+            update: (input: any) => {
+              method = input.method;
+            },
+          },
+        }),
+    },
+  } as unknown as Plugin.Context;
+
+  await registerDataForSeoIntegration(ctx);
+
+  assert.equal(method.type, "key");
+  assert.equal(method.label, "DataForSEO login & API password");
+  assert.equal(method.form[0].key, "login");
+  assert.equal(method.form[0].required, true);
+});
+
+test("DataForSEO: not connected", async (t) => {
+  clearCredentialEnv(t);
+
   await assert.rejects(
     resolveDataForSeoCredentials(ctxWith({})),
     /Run \/connect, choose "DataForSEO"/,

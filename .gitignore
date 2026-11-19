@@ -4,10 +4,6 @@ dist/
 .DS_Store
 *.log
 
-# Local plugin history
-search-history/
-webfetch-history/
-
 # Secrets
 .env
 .env.*

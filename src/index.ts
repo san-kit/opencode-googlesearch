@@ -1,1 +1,1 @@
-export { default } from "./tool";
+export { default } from "./tool.ts";

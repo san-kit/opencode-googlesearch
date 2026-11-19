@@ -1,32 +1,48 @@
 import { Plugin } from "@opencode/plugin";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   appendFile,
+  chmod,
   mkdir,
   readFile,
+  readdir,
   rename,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import {
   registerDataForSeoIntegration,
   resolveDataForSeoCredentials,
-} from "./credentials";
+} from "./credentials.ts";
 
 const API_URL =
   "https://api.dataforseo.com/v3/serp/google/organic/live/advanced";
 const DEVICE = "desktop";
 const OS = "macos";
 const REQUEST_TIMEOUT_MS = 60_000;
+// resolve_goto_urls adds roughly 40-60s; DataForSEO caps total turnaround at 260s.
+const RESOLVE_GOTO_TIMEOUT_MS = 300_000;
 const MAX_QUERIES = 5;
+const MAX_QUERY_LENGTH = 700;
+const MAX_DEPTH = 100;
 const DEFAULT_DEPTH = 10;
 const DEFAULT_LOCATION = "United States";
 const DEFAULT_LANGUAGE = "English";
 const HISTORY_VERSION = 1;
-const CURRENT_DATE = localDateStamp(new Date());
+const HISTORY_RETENTION_DAYS = 30;
+const MAX_COST_LOG_ENTRIES = 10_000;
 const OPERATOR_SOURCE =
-  "allinanchor|allintext|allintitle|allinurl|define|filetype|id|inanchor|info|intext|intitle|inurl|link|site";
+  "allinanchor|allintext|allintitle|allinurl|cache|define|definition|filetype|inanchor|intext|intitle|inurl|link|site";
+const AMBIGUOUS_OPERATOR_SOURCE = "id|info";
+// DataForSEO status codes: https://docs.dataforseo.com/v3/appendix/errors/
+// 40200 Payment Required, 40210 insufficient funds.
+const OUT_OF_CREDITS_CODES = new Set<unknown>([40200, 40210]);
+// 40101 internal SE server error, 40103 task execution failed (resubmit).
+const TRANSIENT_TASK_CODES = new Set<unknown>([40101, 40103]);
+const NO_RESULTS_CODE = 40102;
 
 type LocationEntry = { code: number; name: string; iso: string };
 type LanguageEntry = { name: string; code: string };
@@ -78,6 +94,8 @@ type ResolvedParams = {
   device: string;
   os: string;
   depth: number;
+  resolve_goto_urls: boolean;
+  load_async_ai_overview: boolean;
 };
 
 type QueryResult = {
@@ -92,6 +110,7 @@ type QueryResult = {
   error?: string;
   cost_usd?: number;
   fetched_at?: string;
+  duration_ms?: number;
 };
 
 type CostEntry = {
@@ -123,17 +142,20 @@ type HistoryRecord = {
     language: string;
     language_code: string;
     target: string | null;
+    resolve_goto_urls: boolean;
+    load_async_ai_overview: boolean;
   };
   status: "ok" | "no_results" | "error";
   error: string | null;
   cost: number | null;
   cost_currency: "USD";
+  duration_ms: number;
   normalized: unknown;
   raw: unknown;
 };
 
 type ApiSuccess = { ok: true; body: any };
-type ApiFailure = { ok: false; message: string };
+type ApiFailure = { ok: false; message: string; transient?: boolean };
 type ApiResponse = ApiSuccess | ApiFailure;
 
 function round6(value: number): number {
@@ -157,6 +179,26 @@ function localDateStamp(date: Date): string {
 
 function normalizeKey(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function hostFromUrl(value: string): string | undefined {
+  try {
+    const host = new URL(value).hostname.toLowerCase().replace(/^www\./, "");
+    return host || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isGoogleRedirectUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)google\.[a-z.]+$/.test(url.hostname.toLowerCase()))
+      return false;
+    return url.pathname.startsWith("/goto") || url.pathname.startsWith("/url");
+  } catch {
+    return false;
+  }
 }
 
 function extractTask(body: any): any {
@@ -193,7 +235,7 @@ async function buildReferenceData(): Promise<ReferenceData> {
   } catch {
     throw new Error(
       `googlesearch reference data is missing or unreadable. Expected locations.json and languages.json in ${dir}. ` +
-        `Deploy them next to the tools directory as described in the googlesearch README.`,
+        `Reinstall the plugin package; the data directory ships with it.`,
     );
   }
   if (
@@ -303,6 +345,7 @@ function resolveLanguage(
 
 function resolveDepth(
   input: unknown,
+  allowedMax: number,
 ): { ok: true; value: number } | { ok: false; error: string } {
   if (input === undefined || input === null || input === "")
     return { ok: true, value: DEFAULT_DEPTH };
@@ -311,12 +354,16 @@ function resolveDepth(
   if (
     !Number.isInteger(numeric) ||
     numeric < 10 ||
-    numeric > 100 ||
+    numeric > allowedMax ||
     numeric % 10 !== 0
   ) {
+    const allowed = Array.from(
+      { length: allowedMax / 10 },
+      (_, index) => (index + 1) * 10,
+    ).join(", ");
     return {
       ok: false,
-      error: `depth must be one of 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 (Google results per query; 10 = first page = 1 SERP; default 10). Received: ${jsonString(input)}.`,
+      error: `depth must be one of ${allowed} (Google results per query; 10 = first page = 1 SERP; default 10; configured maximum ${allowedMax}). Received: ${jsonString(input)}.`,
     };
   }
   return { ok: true, value: numeric };
@@ -324,11 +371,16 @@ function resolveDepth(
 
 function detectOperators(queries: string[]): string[] {
   const pattern = new RegExp(`\\b(?:${OPERATOR_SOURCE}):`, "gi");
+  // info: and id: are also ordinary English words ("contact info:"), so only
+  // count them when they appear as the leading operator of the query.
+  const leadingPattern = new RegExp(`^(?:${AMBIGUOUS_OPERATOR_SOURCE}):`, "i");
   const found = new Set<string>();
   for (const query of queries) {
     for (const match of query.matchAll(pattern)) {
       found.add(match[0].slice(0, -1).toLowerCase());
     }
+    const leading = query.match(leadingPattern);
+    if (leading) found.add(leading[0].slice(0, -1).toLowerCase());
   }
   return [...found].sort();
 }
@@ -337,8 +389,8 @@ function buildAuthHeader(credentials: Credentials): string {
   return `Basic ${Buffer.from(`${credentials.login}:${credentials.password}`, "utf8").toString("base64")}`;
 }
 
-function buildSignal(external?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+function buildSignal(timeoutMs: number, external?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
   if (external && typeof AbortSignal.any === "function")
     return AbortSignal.any([timeout, external]);
   return timeout;
@@ -347,6 +399,7 @@ function buildSignal(external?: AbortSignal): AbortSignal {
 async function callLiveApi(
   task: Record<string, unknown>,
   authHeader: string,
+  timeoutMs: number,
   externalAbort?: AbortSignal,
 ): Promise<ApiResponse> {
   let response: Response;
@@ -358,20 +411,23 @@ async function callLiveApi(
         "Content-Type": "application/json",
       },
       body: jsonString([task]),
-      signal: buildSignal(externalAbort),
+      redirect: "error",
+      signal: buildSignal(timeoutMs, externalAbort),
     });
   } catch (error) {
+    // Check the session signal first: it may abort with a custom reason whose
+    // name is neither AbortError nor TimeoutError.
+    if (externalAbort?.aborted) {
+      return {
+        ok: false,
+        message: "Search was aborted (session cancelled).",
+      };
+    }
     const name = error instanceof Error ? error.name : "";
     if (name === "TimeoutError") {
       return {
         ok: false,
-        message: `DataForSEO request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. The request was NOT retried because every attempt can incur billing.`,
-      };
-    }
-    if (name === "AbortError" && externalAbort?.aborted) {
-      return {
-        ok: false,
-        message: "Search was aborted (session cancelled).",
+        message: `DataForSEO request timed out after ${timeoutMs / 1000}s. The request was NOT retried because every attempt can incur billing.`,
       };
     }
     const detail = error instanceof Error ? error.message : String(error);
@@ -399,8 +455,8 @@ async function callLiveApi(
   const taskPayload = extractTask(body);
   if (
     response.status === 402 ||
-    body?.status_code === 40200 ||
-    taskPayload?.status_code === 40200
+    OUT_OF_CREDITS_CODES.has(body?.status_code) ||
+    OUT_OF_CREDITS_CODES.has(taskPayload?.status_code)
   ) {
     return {
       ok: false,
@@ -413,6 +469,7 @@ async function callLiveApi(
     return {
       ok: false,
       message: `DataForSEO returned HTTP ${response.status}${body?.status_message ? `: ${body.status_message}` : ""}.`,
+      transient: response.status >= 500,
     };
   }
   if (body?.status_code !== 20000) {
@@ -424,11 +481,14 @@ async function callLiveApi(
   if (
     taskPayload !== body &&
     taskPayload?.status_code !== undefined &&
-    taskPayload.status_code !== 20000
+    taskPayload.status_code !== 20000 &&
+    // 40102 "No Search Results" is a valid empty SERP, reported as no_results.
+    taskPayload.status_code !== NO_RESULTS_CODE
   ) {
     return {
       ok: false,
       message: `DataForSEO task error ${taskPayload.status_code}: ${taskPayload.status_message ?? "no status message returned"}.`,
+      transient: TRANSIENT_TASK_CODES.has(taskPayload.status_code),
     };
   }
   return { ok: true, body };
@@ -436,15 +496,26 @@ async function callLiveApi(
 
 const TRANSIENT_RETRY_DELAY_MS = 5_000;
 
-function isTransientFailure(message: unknown): boolean {
-  return (
-    typeof message === "string" &&
-    (message.includes("40101") || /HTTP 5\d\d/.test(message))
-  );
-}
-
-function sleepRetry(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleepRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolveSleep, rejectSleep) => {
+    if (signal?.aborted) {
+      rejectSleep(new Error("Search was aborted (session cancelled)."));
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      resolveSleep();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      rejectSleep(new Error("Search was aborted (session cancelled)."));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function normalizeItems(items: any[]): {
@@ -466,8 +537,22 @@ function normalizeItems(items: any[]): {
       };
       if (typeof item.title === "string" && item.title.trim())
         entry.title = item.title.trim();
-      if (typeof item.domain === "string" && item.domain.trim())
-        entry.domain = item.domain.trim();
+      const reportedDomain =
+        typeof item.domain === "string" && item.domain.trim()
+          ? item.domain.trim()
+          : undefined;
+      const host = hostFromUrl(item.url);
+      const reportedIsGoogle =
+        reportedDomain?.toLowerCase().replace(/^www\./, "") === "google.com";
+      // Older responses sometimes leave domain as google.com after resolving
+      // the url; derive it from the final URL in that case.
+      if (
+        host &&
+        host !== "google.com" &&
+        (!reportedDomain || reportedIsGoogle)
+      )
+        entry.domain = host;
+      else if (reportedDomain) entry.domain = reportedDomain;
       if (typeof item.description === "string" && item.description.trim())
         entry.description = item.description.trim();
       organic.push(entry);
@@ -528,7 +613,7 @@ function normalizeTargetDomain(target: string): string {
     .toLowerCase()
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
-    .split("/")[0];
+    .split(/[/?#:]/)[0];
 }
 
 function annotateTarget(
@@ -539,14 +624,9 @@ function annotateTarget(
   const positions: number[] = [];
   const urls: string[] = [];
   for (const result of organic) {
-    let host = "";
-    try {
-      host = new URL(result.url).hostname.toLowerCase();
-    } catch {
-      continue;
-    }
-    const bare = host.replace(/^www\./, "");
-    if (bare === wanted || bare.endsWith(`.${wanted}`)) {
+    const host = hostFromUrl(result.url);
+    if (!host) continue;
+    if (host === wanted || host.endsWith(`.${wanted}`)) {
       positions.push(result.position);
       urls.push(result.url);
     }
@@ -560,50 +640,209 @@ function annotateTarget(
   };
 }
 
-type HistoryConfig = { enabled: boolean; dir: string };
+type HistoryConfig = {
+  enabled: boolean;
+  dir: string;
+  // Only the plugin-owned default directory is chmod-ed when it already
+  // exists; a configured path may point at a directory the user shares.
+  ownsDir: boolean;
+  raw: boolean;
+  retentionDays: number;
+  warning?: string;
+};
 
-function historyConfig(
-  options: Readonly<Record<string, any>>,
-  locationDirectory: string,
-): HistoryConfig {
-  const flag = process.env.GOOGLESEARCH_HISTORY?.trim().toLowerCase();
-  const enabled =
-    !(flag === "0" || flag === "false" || flag === "off" || flag === "no") &&
-    options.history !== false;
+type SearchConfig = {
+  resolveGotoUrls: boolean;
+  aiOverview: boolean;
+  maxDepth: number;
+  timeoutMs: number;
+};
+
+function booleanSetting(
+  envValue: string | undefined,
+  option: unknown,
+  fallback: boolean,
+): boolean {
+  const flag = envValue?.trim().toLowerCase();
+  if (flag === "1" || flag === "true" || flag === "on" || flag === "yes")
+    return true;
+  if (flag === "0" || flag === "false" || flag === "off" || flag === "no")
+    return false;
+  return typeof option === "boolean" ? option : fallback;
+}
+
+function integerSetting(
+  envValue: string | undefined,
+  option: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw =
+    envValue?.trim() ||
+    (typeof option === "number"
+      ? String(option)
+      : typeof option === "string"
+        ? option.trim()
+        : "");
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) return fallback;
+  return value;
+}
+
+function searchConfig(options: Readonly<Record<string, any>>): SearchConfig {
+  // Goto links are opaque tokens, so they can only be resolved by DataForSEO.
+  // Default to on: without it most result URLs are unusable google.com redirects.
+  const resolveGotoUrls = booleanSetting(
+    process.env.GOOGLESEARCH_RESOLVE_GOTO_URLS,
+    options.resolveGotoUrls,
+    true,
+  );
+  const aiOverview = booleanSetting(
+    process.env.GOOGLESEARCH_AI_OVERVIEW,
+    options.aiOverview,
+    false,
+  );
+  // maxDepth is a billing cap, so out-of-range numbers are clamped rather than
+  // falling back to the most expensive value.
+  const rawMaxDepth = Number(
+    process.env.GOOGLESEARCH_MAX_DEPTH?.trim() || options.maxDepth,
+  );
+  const maxDepth = Number.isFinite(rawMaxDepth)
+    ? Math.min(
+        MAX_DEPTH,
+        Math.max(DEFAULT_DEPTH, Math.floor(rawMaxDepth / 10) * 10),
+      )
+    : MAX_DEPTH;
+  return {
+    resolveGotoUrls,
+    aiOverview,
+    maxDepth,
+    timeoutMs: resolveGotoUrls ? RESOLVE_GOTO_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+  };
+}
+
+function defaultHistoryDir(): string {
+  return join(
+    process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"),
+    "opencode",
+    "plugin-data",
+    "googlesearch",
+  );
+}
+
+function historyConfig(options: Readonly<Record<string, any>>): HistoryConfig {
+  // Environment variables consistently take precedence over plugin options.
+  const enabled = booleanSetting(
+    process.env.GOOGLESEARCH_HISTORY,
+    options.history,
+    true,
+  );
+  const raw = booleanSetting(
+    process.env.GOOGLESEARCH_HISTORY_RAW,
+    options.historyRaw,
+    false,
+  );
+  const retentionDays = integerSetting(
+    process.env.GOOGLESEARCH_HISTORY_RETENTION_DAYS,
+    options.historyRetentionDays,
+    HISTORY_RETENTION_DAYS,
+    0,
+    3650,
+  );
 
   const configured =
-    (typeof options.historyPath === "string" && options.historyPath.trim()) ||
-    process.env.GOOGLESEARCH_HISTORY_PATH?.trim();
+    process.env.GOOGLESEARCH_HISTORY_PATH?.trim() ||
+    (typeof options.historyPath === "string" ? options.historyPath.trim() : "");
 
-  const dir = configured
-    ? isAbsolute(configured)
-      ? configured
-      : resolve(locationDirectory, configured)
-    : join(
-        process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"),
-        "opencode",
-        "plugin-data",
-        "googlesearch",
-      );
+  let dir = defaultHistoryDir();
+  let ownsDir = true;
+  let warning: string | undefined;
+  if (configured) {
+    if (isAbsolute(configured)) {
+      dir = configured;
+      ownsDir = false;
+    } else {
+      // A relative path would resolve against the server's working directory,
+      // which is often the repository itself.
+      warning = `historyPath ${jsonString(configured)} was ignored: only absolute paths are allowed, so history is written to ${dir}.`;
+    }
+  }
 
-  return { enabled, dir };
+  return { enabled, dir, ownsDir, raw, retentionDays, warning };
+}
+
+async function ensureSecureDir(history: HistoryConfig): Promise<void> {
+  // Newly created directories get 0700 from mkdir.
+  const created = await mkdir(history.dir, { recursive: true, mode: 0o700 });
+  if (created !== undefined || !history.ownsDir) return;
+  try {
+    await chmod(history.dir, 0o700);
+  } catch {}
+}
+
+const HISTORY_FILE_PATTERN = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
+
+async function pruneHistory(dir: string, retentionDays: number): Promise<void> {
+  if (retentionDays <= 0) return;
+  const cutoff = localDateStamp(
+    new Date(Date.now() - retentionDays * 86_400_000),
+  );
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  const cutoffFile = `${cutoff}.jsonl`;
+  await Promise.all(
+    names
+      .filter((name) => HISTORY_FILE_PATTERN.test(name) && name < cutoffFile)
+      .map((name) => unlink(join(dir, name)).catch(() => {})),
+  );
 }
 
 async function writeHistory(
   records: HistoryRecord[],
-  dir: string,
+  history: HistoryConfig,
 ): Promise<void> {
   if (records.length === 0) return;
-  await mkdir(dir, { recursive: true });
-  const file = join(dir, `${localDateStamp(new Date())}.jsonl`);
+  await ensureSecureDir(history);
+  const file = join(history.dir, `${localDateStamp(new Date())}.jsonl`);
   const payload = records.map((record) => jsonString(record)).join("\n") + "\n";
-  await appendFile(file, payload, "utf8");
+  await appendFile(file, payload, { encoding: "utf8", mode: 0o600 });
+  try {
+    await chmod(file, 0o600);
+  } catch {}
+  await pruneHistory(history.dir, history.retentionDays);
 }
 
-async function updateCostLog(entries: CostEntry[], dir: string): Promise<void> {
-  if (entries.length === 0) return;
-  await mkdir(dir, { recursive: true });
-  const file = join(dir, "cost-log.json");
+const costLogQueues = new Map<string, Promise<void>>();
+
+// Serialize read-modify-write cycles per history directory. Without this,
+// parallel tool calls in one server process overwrite each other's entries.
+function updateCostLog(
+  entries: CostEntry[],
+  history: HistoryConfig,
+): Promise<void> {
+  if (entries.length === 0) return Promise.resolve();
+  const file = join(history.dir, "cost-log.json");
+  const previous = costLogQueues.get(file) ?? Promise.resolve();
+  const next = previous.then(() => updateCostLogNow(entries, history));
+  costLogQueues.set(
+    file,
+    next.catch(() => {}),
+  );
+  return next;
+}
+
+async function updateCostLogNow(
+  entries: CostEntry[],
+  history: HistoryConfig,
+): Promise<void> {
+  await ensureSecureDir(history);
+  const file = join(history.dir, "cost-log.json");
 
   let log: {
     total_cost_usd: number;
@@ -620,12 +859,15 @@ async function updateCostLog(entries: CostEntry[], dir: string): Promise<void> {
   try {
     const parsed = JSON.parse(await readFile(file, "utf8"));
     if (parsed && Array.isArray(parsed.entries)) {
+      const storedEntries = parsed.entries as CostEntry[];
       log = {
         total_cost_usd: Number(parsed.total_cost_usd) || 0,
-        total_searches: Number(parsed.total_searches) || 0,
+        total_searches: Number.isInteger(parsed.total_searches)
+          ? parsed.total_searches
+          : storedEntries.length,
         updated_at:
           typeof parsed.updated_at === "string" ? parsed.updated_at : "",
-        entries: parsed.entries as CostEntry[],
+        entries: storedEntries,
       };
     } else {
       corrupted = true;
@@ -640,16 +882,32 @@ async function updateCostLog(entries: CostEntry[], dir: string): Promise<void> {
     } catch {}
   }
 
-  log.entries = [...entries, ...log.entries];
-  log.total_searches = log.entries.length;
-  log.total_cost_usd = round6(
-    log.entries.reduce((sum, entry) => sum + (Number(entry.cost_usd) || 0), 0),
+  const addedCost = entries.reduce(
+    (sum, entry) => sum + (Number(entry.cost_usd) || 0),
+    0,
   );
+  log.total_searches += entries.length;
+  log.total_cost_usd = round6(log.total_cost_usd + addedCost);
+  // Entries contain query text, so they follow the history retention window.
+  // The totals stay cumulative.
+  const cutoff =
+    history.retentionDays > 0
+      ? Date.now() - history.retentionDays * 86_400_000
+      : -Infinity;
+  log.entries = [...entries, ...log.entries]
+    .filter((entry) => !(Date.parse(entry?.timestamp) < cutoff))
+    .slice(0, MAX_COST_LOG_ENTRIES);
   log.updated_at = new Date().toISOString();
 
-  const tmp = `${file}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(log, null, 2) + "\n", "utf8");
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(tmp, JSON.stringify(log, null, 2) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   await rename(tmp, file);
+  try {
+    await chmod(file, 0o600);
+  } catch {}
 }
 
 export default Plugin.define({
@@ -657,7 +915,8 @@ export default Plugin.define({
   async setup(ctx) {
     await registerDataForSeoIntegration(ctx);
     const locationDirectory = ctx.location.directory;
-    const history = historyConfig(ctx.options, locationDirectory);
+    const history = historyConfig(ctx.options);
+    const search = searchConfig(ctx.options);
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "googlesearch",
@@ -668,15 +927,18 @@ export default Plugin.define({
           properties: {
             queries: {
               type: "array",
-              items: { type: "string", minLength: 1, maxLength: 700 },
+              items: {
+                type: "string",
+                minLength: 1,
+                maxLength: MAX_QUERY_LENGTH,
+              },
               minItems: 1,
               maxItems: MAX_QUERIES,
-              description: `1 to ${MAX_QUERIES} Google search queries, run in parallel. Today is ${CURRENT_DATE} — keep queries current, never search with stale years. Be strategic: one well-crafted query is usually enough; add more only when they genuinely add value, never reworded copies of the same question. If results aren't enough, think about why and refine your search instead of repeating similar ones. site: works inside a query if needed. Format: a plain array of strings only, e.g. ["iphone 17 price", "pixel 11 review"] — never objects like {"query": "..."}, never one stringified array. If only a search term is needed, pass just the queries and leave location/language out; the defaults apply.`,
+              description: `1 to ${MAX_QUERIES} Google search queries, run in parallel. Keep queries current; never search with stale years. Be strategic: one well-crafted query is usually enough; add more only when they genuinely add value, never reworded copies of the same question. If results aren't enough, think about why and refine your search instead of repeating similar ones. site: works inside a query if needed. Format: a plain array of strings only, e.g. ["iphone 17 price", "pixel 11 review"] — never objects like {"query": "..."}, never one stringified array. If only a search term is needed, pass just the queries and leave location/language out; the defaults apply.`,
             },
             depth: {
               anyOf: [{ type: "number" }, { type: "string" }],
-              description:
-                "Google results per query: 10 (default, first page) up to 100, in steps of 10. Billing is per 10 results, so only raise depth when more results are genuinely needed.",
+              description: `Google results per query: 10 (default, first page) up to ${search.maxDepth}, in steps of 10. Billing is per 10 results, so only raise depth when more results are genuinely needed.`,
             },
             location: {
               anyOf: [{ type: "string" }, { type: "number" }],
@@ -697,7 +959,7 @@ export default Plugin.define({
           required: ["queries"],
           additionalProperties: false,
         },
-        options: { codemode: false },
+        options: { codemode: false, permission: "googlesearch" },
 
         async execute(rawArgs, context) {
           const args = rawArgs as {
@@ -725,7 +987,7 @@ export default Plugin.define({
             );
           }
 
-          const depth = resolveDepth(args.depth);
+          const depth = resolveDepth(args.depth, search.maxDepth);
           if (!depth.ok) return errorResult(depth.error);
 
           const location = resolveLocation(args.location, data);
@@ -734,10 +996,24 @@ export default Plugin.define({
           const language = resolveLanguage(args.language, data);
           if (!language.ok) return errorResult(language.error);
 
+          if (!Array.isArray(args.queries)) {
+            return errorResult("queries must be an array of search strings.");
+          }
+          if (args.queries.length > MAX_QUERIES) {
+            return errorResult(
+              `queries accepts at most ${MAX_QUERIES} queries per call (received ${args.queries.length}). Split the searches into multiple calls instead.`,
+            );
+          }
           const trimmed: string[] = [];
           for (const query of args.queries) {
             const candidate = typeof query === "string" ? query.trim() : "";
-            if (candidate) trimmed.push(candidate);
+            if (!candidate) continue;
+            if (candidate.length > MAX_QUERY_LENGTH) {
+              return errorResult(
+                `Query is ${candidate.length} characters long; DataForSEO accepts at most ${MAX_QUERY_LENGTH} characters per query. Shorten the query and try again.`,
+              );
+            }
+            trimmed.push(candidate);
           }
           if (trimmed.length === 0) {
             return errorResult(
@@ -757,6 +1033,7 @@ export default Plugin.define({
           }
 
           const notes: string[] = [];
+          if (history.enabled && history.warning) notes.push(history.warning);
           if (duplicates.length > 0) {
             notes.push(
               `Duplicate queries were deduplicated and executed once: ${duplicates.map((d) => jsonString(d)).join(", ")}.`,
@@ -765,7 +1042,7 @@ export default Plugin.define({
           const operators = detectOperators(unique);
           if (operators.length > 0) {
             notes.push(
-              `Google operator(s) detected: ${operators.map((operator) => `${operator}:`).join(", ")} — DataForSEO bills each operator at 5x the base SERP price.`,
+              `Google operator(s) detected: ${operators.map((operator) => `${operator}:`).join(", ")} — DataForSEO multiplies the whole task price by 5 when a query contains one or more of these operators.`,
             );
           }
 
@@ -777,85 +1054,125 @@ export default Plugin.define({
             device: DEVICE,
             os: OS,
             depth: depth.value,
+            resolve_goto_urls: search.resolveGotoUrls,
+            load_async_ai_overview: search.aiOverview,
           };
           const target =
             typeof args.target === "string" && args.target.trim()
               ? args.target.trim()
               : undefined;
 
+          // options.permission only hides the tool on a blanket deny; ask
+          // rules and per-query rules are enforced here. Rejections propagate.
+          await ctx.permission.assert({
+            sessionID: context.sessionID,
+            agent: context.agent,
+            source: {
+              type: "tool",
+              messageID: context.messageID,
+              id: context.id,
+            },
+            action: "googlesearch",
+            resources: unique,
+            save: ["*"],
+            metadata: {
+              queries: unique,
+              depth: depth.value,
+              location: location.value.name,
+              language: language.value.name,
+            },
+          });
+
           const authHeader = buildAuthHeader(credentials);
-          const responses = await Promise.allSettled(
-            unique.map((keyword) =>
-              callLiveApi(
-                {
-                  keyword,
-                  location_code: location.value.code,
-                  language_code: language.value.code,
-                  device: DEVICE,
-                  os: OS,
-                  depth: depth.value,
-                },
+          const buildTask = (keyword: string): Record<string, unknown> => ({
+            keyword,
+            location_code: location.value.code,
+            language_code: language.value.code,
+            device: DEVICE,
+            os: OS,
+            depth: depth.value,
+            resolve_goto_urls: search.resolveGotoUrls,
+            ...(search.aiOverview ? { load_async_ai_overview: true } : {}),
+          });
+          const batchStartedAt = Date.now();
+          // Per-query request time in ms, summed over the first attempt and
+          // any retry; the retry wait is excluded.
+          const queryDurations = new Map<number, number>();
+          const timed = async (index: number): Promise<ApiResponse> => {
+            const startedAt = Date.now();
+            try {
+              return await callLiveApi(
+                buildTask(unique[index]),
                 authHeader,
+                search.timeoutMs,
                 context.signal,
-              ),
-            ),
+              );
+            } finally {
+              queryDurations.set(
+                index,
+                (queryDurations.get(index) ?? 0) + Date.now() - startedAt,
+              );
+            }
+          };
+          const responses = await Promise.allSettled(
+            unique.map((_, index) => timed(index)),
           );
 
-          // Retry transient SE-side failures (40101 / HTTP 5xx) exactly once after a pause.
+          // Retry transient failures (HTTP 5xx, task 40101/40103) exactly once after a pause.
           // DataForSEO bills $0 for failed tasks, so a retry costs nothing unless it recovers.
           const retryIndexes: number[] = [];
           responses.forEach((settled, index) => {
             if (
               settled.status === "fulfilled" &&
               !settled.value.ok &&
-              isTransientFailure(settled.value.message)
+              settled.value.transient
             )
               retryIndexes.push(index);
           });
-          if (retryIndexes.length > 0 && !context.signal.aborted) {
-            await sleepRetry(TRANSIENT_RETRY_DELAY_MS);
-            const retries = await Promise.allSettled(
-              retryIndexes.map((index) =>
-                callLiveApi(
-                  {
-                    keyword: unique[index],
-                    location_code: location.value.code,
-                    language_code: language.value.code,
-                    device: DEVICE,
-                    os: OS,
-                    depth: depth.value,
-                  },
-                  authHeader,
-                  context.signal,
-                ),
-              ),
-            );
-            let recovered = 0;
-            retryIndexes.forEach((index, slot) => {
-              const retry = retries[slot];
-              if (retry.status === "fulfilled" && retry.value.ok) {
-                responses[index] = retry;
-                recovered += 1;
-                return;
+          if (retryIndexes.length > 0) {
+            let retryAllowed = !context.signal.aborted;
+            if (retryAllowed) {
+              try {
+                await sleepRetry(TRANSIENT_RETRY_DELAY_MS, context.signal);
+              } catch {
+                retryAllowed = false;
               }
-              const first = responses[index];
-              const baseMessage =
-                retry.status === "fulfilled" && !retry.value.ok
-                  ? retry.value.message
-                  : first.status === "fulfilled" && !first.value.ok
-                    ? first.value.message
-                    : "Search failed.";
-              responses[index] = {
-                status: "fulfilled",
-                value: {
-                  ok: false,
-                  message: `${baseMessage} Search failed after 1 retry.`,
-                },
-              };
-            });
-            notes.push(
-              `Retried ${retryIndexes.length} transiently failed query(ies) once after 5s; ${recovered} recovered.`,
-            );
+            }
+            if (!retryAllowed) {
+              notes.push(
+                "Retry skipped because the search was cancelled. DataForSEO may still bill the original request.",
+              );
+            } else {
+              const retries = await Promise.allSettled(
+                retryIndexes.map((index) => timed(index)),
+              );
+              let recovered = 0;
+              retryIndexes.forEach((index, slot) => {
+                const retry = retries[slot];
+                if (retry.status === "fulfilled" && retry.value.ok) {
+                  responses[index] = retry;
+                  recovered += 1;
+                  return;
+                }
+                const first = responses[index];
+                const baseMessage =
+                  retry.status === "fulfilled" && !retry.value.ok
+                    ? retry.value.message
+                    : first.status === "fulfilled" && !first.value.ok
+                      ? first.value.message
+                      : "Search failed.";
+                responses[index] = {
+                  status: "fulfilled",
+                  value: {
+                    ok: false,
+                    message: `${baseMessage} Search failed after 1 retry.`,
+                  },
+                };
+              });
+              notes.push(
+                `Retried ${retryIndexes.length} transiently failed query(ies) once after 5s; ${recovered} recovered.`,
+              );
+            }
           }
 
           const searches: QueryResult[] = [];
@@ -864,6 +1181,7 @@ export default Plugin.define({
           let executed = 0;
           let totalCost = 0;
           let totalResults = 0;
+          let unresolvedRedirects = 0;
 
           unique.forEach((keyword, index) => {
             const settled = responses[index];
@@ -886,6 +1204,8 @@ export default Plugin.define({
                 language: language.value.name,
                 language_code: language.value.code,
                 target: target ?? null,
+                resolve_goto_urls: search.resolveGotoUrls,
+                load_async_ai_overview: search.aiOverview,
               },
             };
             const costBase = {
@@ -895,6 +1215,7 @@ export default Plugin.define({
               language: language.value.name,
               depth: depth.value,
             };
+            const durationMs = queryDurations.get(index) ?? 0;
 
             if (settled.status === "rejected") {
               const message = `Unexpected internal error: ${settled.reason instanceof Error ? settled.reason.message : String(settled.reason)}`;
@@ -903,9 +1224,11 @@ export default Plugin.define({
                 status: "error",
                 resolved,
                 error: message,
+                duration_ms: durationMs,
               });
               historyRecords.push({
                 ...historyBase,
+                duration_ms: durationMs,
                 status: "error",
                 error: message,
                 cost: null,
@@ -929,9 +1252,11 @@ export default Plugin.define({
                 status: "error",
                 resolved,
                 error: response.message,
+                duration_ms: durationMs,
               });
               historyRecords.push({
                 ...historyBase,
+                duration_ms: durationMs,
                 status: "error",
                 error: response.message,
                 cost: null,
@@ -965,6 +1290,10 @@ export default Plugin.define({
               ? taskResult.items
               : [];
             const normalized = normalizeItems(items);
+            if (search.resolveGotoUrls)
+              unresolvedRedirects += normalized.organic.filter((item) =>
+                isGoogleRedirectUrl(item.url),
+              ).length;
             const fetchedAt =
               typeof taskResult?.datetime === "string"
                 ? taskResult.datetime
@@ -980,15 +1309,17 @@ export default Plugin.define({
                 results_count: 0,
                 cost_usd: cost ?? undefined,
                 fetched_at: fetchedAt,
+                duration_ms: durationMs,
               });
               historyRecords.push({
                 ...historyBase,
+                duration_ms: durationMs,
                 status: "no_results",
                 error: null,
                 cost,
                 cost_currency: "USD",
                 normalized: { ai_overview: null, organic: [] },
-                raw: body,
+                raw: history.raw ? body : null,
               });
               costEntries.push({
                 ...costBase,
@@ -1005,6 +1336,7 @@ export default Plugin.define({
               resolved,
               organic: normalized.organic,
               results_count: normalized.organic.length,
+              duration_ms: durationMs,
             };
             if (normalized.aiOverview)
               result.ai_overview = normalized.aiOverview;
@@ -1017,6 +1349,7 @@ export default Plugin.define({
 
             historyRecords.push({
               ...historyBase,
+              duration_ms: durationMs,
               status: "ok",
               error: null,
               cost,
@@ -1026,7 +1359,7 @@ export default Plugin.define({
                 organic: normalized.organic,
                 target: result.target ?? null,
               },
-              raw: body,
+              raw: history.raw ? body : null,
             });
             costEntries.push({
               ...costBase,
@@ -1036,10 +1369,16 @@ export default Plugin.define({
             });
           });
 
+          if (search.resolveGotoUrls && unresolvedRedirects > 0) {
+            notes.push(
+              `${unresolvedRedirects} result URL(s) were still Google redirect links after goto resolution; DataForSEO returned the original URL when a redirect could not be resolved.`,
+            );
+          }
+
           if (history.enabled) {
             try {
-              await writeHistory(historyRecords, history.dir);
-              await updateCostLog(costEntries, history.dir);
+              await writeHistory(historyRecords, history);
+              await updateCostLog(costEntries, history);
             } catch (error) {
               notes.push(
                 `Search completed, but local history could not be saved: ${error instanceof Error ? error.message : String(error)}`,
@@ -1047,16 +1386,17 @@ export default Plugin.define({
             }
           }
 
+          const today = localDateStamp(new Date());
           return {
             content: jsonString({
+              today,
               searches,
               totals: {
-                queries_requested: Array.isArray(args.queries)
-                  ? args.queries.length
-                  : 0,
+                queries_requested: args.queries.length,
                 queries_executed: executed,
                 results: totalResults,
                 cost_usd: round6(totalCost),
+                duration_ms: Date.now() - batchStartedAt,
               },
               ...(notes.length > 0 ? { notes } : {}),
             }),

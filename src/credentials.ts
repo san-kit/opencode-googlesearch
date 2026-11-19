@@ -1,8 +1,9 @@
 import type { Plugin } from "@opencode/plugin";
 
 /**
- * The integration ID is namespaced so a future built-in integration with the
- * same name cannot collide with this plugin.
+ * Use the canonical integration ID so users see a single clear DataForSEO
+ * entry in /connect. Keeping it stable preserves existing connections; a
+ * future built-in integration with the same ID would take precedence.
  */
 export const DATAFORSEO_INTEGRATION_ID = "dataforseo";
 
@@ -14,9 +15,9 @@ export type DataForSeoCredentials = {
 /**
  * Registers the DataForSEO integration and its credential form.
  *
- * OpenCode shows this integration in `/connect`. The form is an `external`
- * method, which stores the answers as credential metadata without asking for
- * a separate "API key" prompt.
+ * The login is collected by the form and the API password is the connection
+ * key. OpenCode stores the key as the credential secret, so the password is
+ * not kept in form metadata.
  */
 export async function registerDataForSeoIntegration(
   ctx: Plugin.Context,
@@ -29,9 +30,8 @@ export async function registerDataForSeoIntegration(
     editor.method.update({
       integrationID: DATAFORSEO_INTEGRATION_ID,
       method: {
-        id: "login-password",
-        type: "external",
-        label: "DataForSEO login & password",
+        type: "key",
+        label: "DataForSEO login & API password",
         form: [
           {
             type: "string",
@@ -39,14 +39,6 @@ export async function registerDataForSeoIntegration(
             title: "DataForSEO login",
             description:
               "Your DataForSEO account login, usually the account email.",
-            required: true,
-          },
-          {
-            type: "string",
-            key: "password",
-            title: "DataForSEO password",
-            description:
-              "Your DataForSEO API password. OpenCode stores it in its credential store; this plugin never writes it to disk.",
             required: true,
           },
         ],
@@ -59,8 +51,10 @@ export async function registerDataForSeoIntegration(
  * Resolves credentials in this order:
  *
  * 1. `DATAFORSEO_LOGIN` + `DATAFORSEO_PASSWORD` environment variables (CI).
- * 2. The active `dataforseo` connection created through `/connect`.
- * 3. A key credential in the form `login:password` (advanced users).
+ * 2. The active `dataforseo` connection created through `/connect`:
+ *    - `key`: login from the form metadata, password from the key.
+ *    - `external`: legacy connections created before the key method.
+ *    - A key in the form `login:password` (advanced users).
  *
  * If none is available, the tool returns a clear error instead of making a
  * request.
@@ -80,20 +74,23 @@ export async function resolveDataForSeoCredentials(
   if (connection) {
     const credential = await ctx.integration.connection.resolve(connection);
 
+    if (credential?.type === "key") {
+      const login = stringValue(credential.metadata?.login);
+      const password = stringValue(credential.key);
+      if (login && password) return { login, password };
+      const parsed = parseLoginPassword(credential.key);
+      if (parsed) return parsed;
+    }
+
     if (credential?.type === "external") {
       const login = stringValue(credential.metadata?.login);
       const password = stringValue(credential.metadata?.password);
       if (login && password) return { login, password };
     }
-
-    if (credential?.type === "key") {
-      const parsed = parseLoginPassword(credential.key);
-      if (parsed) return parsed;
-    }
   }
 
   throw new Error(
-    `googlesearch is not connected. Run /connect, choose "DataForSEO", and enter your login and password. ` +
+    `googlesearch is not connected. Run /connect, choose "DataForSEO", enter your API login, and provide your API password. ` +
       `Alternatively set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD. Do not retry until configured.`,
   );
 }
